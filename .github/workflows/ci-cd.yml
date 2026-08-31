@@ -4,16 +4,9 @@ on:
   push:
     branches: ["master"]
     tags: ["v*.*.*"]
-    paths:
-      - "phase3-advanced/**"
+
   pull_request:
     branches: ["master"]
-    paths:
-      - "phase3-advanced/**"
-
-defaults:
-  run:
-    working-directory: phase3-advanced
 
 env:
   IMAGE_NAME: docker-mastery-demo
@@ -21,16 +14,21 @@ env:
   ECR_REPOSITORY: docker-mastery-demo
 
 jobs:
-  # ---------------------------------------------------------
-  # 1. Lint + unit test - fail fast before touching Docker at all
-  # ---------------------------------------------------------
+
+  # =========================================================
+  # 1. LINT + UNIT TEST
+  # =========================================================
   lint-and-test:
     name: Lint & Test
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.14"
 
@@ -43,57 +41,84 @@ jobs:
       - name: Run tests
         run: pytest -v
 
-  # ---------------------------------------------------------
-  # 2. Build the image once (with cache), scan it, then push
-  #    the SAME already-built image to both registries.
-  # ---------------------------------------------------------
+
+  # =========================================================
+  # 2. BUILD + SCAN + PUSH TO AMAZON ECR
+  # =========================================================
   build-scan-push:
     name: Build, Scan & Push
     needs: lint-and-test
     runs-on: ubuntu-latest
+
     permissions:
       contents: read
-    steps:
-      - uses: actions/checkout@v4
 
-      - name: Compute image tags (commit SHA + latest + git tag if present)
+    steps:
+
+      # -------------------------------------------------------
+      # Checkout repository
+      # -------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+
+      # -------------------------------------------------------
+      # Calculate Docker image tags
+      # -------------------------------------------------------
+      - name: Compute image tags
         id: meta
         run: |
           SHORT_SHA=$(echo "${GITHUB_SHA}" | cut -c1-7)
+
           echo "sha_tag=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+
           if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
             echo "version_tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
           else
             echo "version_tag=" >> "$GITHUB_OUTPUT"
           fi
 
+
+      # -------------------------------------------------------
+      # Setup Docker Buildx
+      # -------------------------------------------------------
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # ---- Build with GitHub Actions layer cache (fast repeat builds) ----
-      - name: Build image (load locally, cached, not pushed yet)
+
+      # -------------------------------------------------------
+      # Build Docker image with GitHub Actions cache
+      # -------------------------------------------------------
+      - name: Build image
         uses: docker/build-push-action@v6
         with:
-          context: phase3-advanced
+          context: .
           load: true
           push: false
+
           tags: |
             ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.sha_tag }}
             ${{ env.IMAGE_NAME }}:latest
+
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # ---- Vulnerability scan BEFORE anything gets pushed ----
+
+      # -------------------------------------------------------
+      # Scan Docker image with Trivy
+      # -------------------------------------------------------
       - name: Scan image with Trivy
         uses: aquasecurity/trivy-action@0.24.0
         with:
           image-ref: ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.sha_tag }}
           format: table
           severity: CRITICAL,HIGH
-          exit-code: "1"   # fail the pipeline if critical/high vulns are found
+          exit-code: "1"
 
-     
-      # ---- AWS ECR push ----
+
+      # -------------------------------------------------------
+      # Configure AWS credentials
+      # -------------------------------------------------------
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -101,18 +126,52 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
+
+      # -------------------------------------------------------
+      # Login to Amazon ECR
+      # -------------------------------------------------------
       - name: Log in to Amazon ECR
         id: ecr-login
         uses: aws-actions/amazon-ecr-login@v2
 
+
+      # -------------------------------------------------------
+      # Tag and push image to Amazon ECR
+      # -------------------------------------------------------
       - name: Tag & push to Amazon ECR
         run: |
           ECR_REPO="${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}"
-          docker tag ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.sha_tag }} "$ECR_REPO:${{ steps.meta.outputs.sha_tag }}"
-          docker tag ${{ env.IMAGE_NAME }}:latest "$ECR_REPO:latest"
-          docker push "$ECR_REPO:${{ steps.meta.outputs.sha_tag }}"
-          docker push "$ECR_REPO:latest"
+
+          echo "ECR Repository: $ECR_REPO"
+
+          # Tag image with commit SHA
+          docker tag \
+            "${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.sha_tag }}" \
+            "$ECR_REPO:${{ steps.meta.outputs.sha_tag }}"
+
+          # Tag image as latest
+          docker tag \
+            "${{ env.IMAGE_NAME }}:latest" \
+            "$ECR_REPO:latest"
+
+          # Push SHA-tagged image
+          docker push \
+            "$ECR_REPO:${{ steps.meta.outputs.sha_tag }}"
+
+          # Push latest image
+          docker push \
+            "$ECR_REPO:latest"
+
+          # Push version tag if triggered by a Git tag
           if [ -n "${{ steps.meta.outputs.version_tag }}" ]; then
-            docker tag ${{ env.IMAGE_NAME }}:latest "$ECR_REPO:${{ steps.meta.outputs.version_tag }}"
-            docker push "$ECR_REPO:${{ steps.meta.outputs.version_tag }}"
+
+            echo "Pushing version tag: ${{ steps.meta.outputs.version_tag }}"
+
+            docker tag \
+              "${{ env.IMAGE_NAME }}:latest" \
+              "$ECR_REPO:${{ steps.meta.outputs.version_tag }}"
+
+            docker push \
+              "$ECR_REPO:${{ steps.meta.outputs.version_tag }}"
+
           fi
