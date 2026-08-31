@@ -1,0 +1,118 @@
+name: Phase 3 - CI/CD (cache, scan, push to ECR)
+
+on:
+  push:
+    branches: ["master"]
+    tags: ["v*.*.*"]
+    paths:
+      - "phase3-advanced/**"
+  pull_request:
+    branches: ["mastar"]
+    paths:
+      - "phase3-advanced/**"
+
+defaults:
+  run:
+    working-directory: phase3-advanced
+
+env:
+  IMAGE_NAME: docker-mastery-demo
+  AWS_REGION: ap-south-1
+  ECR_REPOSITORY: docker-mastery-demo
+
+jobs:
+  # ---------------------------------------------------------
+  # 1. Lint + unit test - fail fast before touching Docker at all
+  # ---------------------------------------------------------
+  lint-and-test:
+    name: Lint & Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Lint with flake8
+        run: flake8 app test_main.py --max-line-length=100
+
+      - name: Run tests
+        run: pytest -v
+
+  # ---------------------------------------------------------
+  # 2. Build the image once (with cache), scan it, then push
+  #    the SAME already-built image to both registries.
+  # ---------------------------------------------------------
+  build-scan-push:
+    name: Build, Scan & Push
+    needs: lint-and-test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute image tags (commit SHA + latest + git tag if present)
+        id: meta
+        run: |
+          SHORT_SHA=$(echo "${GITHUB_SHA}" | cut -c1-7)
+          echo "sha_tag=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            echo "version_tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version_tag=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # ---- Build with GitHub Actions layer cache (fast repeat builds) ----
+      - name: Build image (load locally, cached, not pushed yet)
+        uses: docker/build-push-action@v6
+        with:
+          context: phase3-advanced
+          load: true
+          push: false
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.sha_tag }}
+            ${{ env.IMAGE_NAME }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # ---- Vulnerability scan BEFORE anything gets pushed ----
+      - name: Scan image with Trivy
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.sha_tag }}
+          format: table
+          severity: CRITICAL,HIGH
+          exit-code: "1"   # fail the pipeline if critical/high vulns are found
+
+     
+      # ---- AWS ECR push ----
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Tag & push to Amazon ECR
+        run: |
+          ECR_REPO="${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}"
+          docker tag ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.sha_tag }} "$ECR_REPO:${{ steps.meta.outputs.sha_tag }}"
+          docker tag ${{ env.IMAGE_NAME }}:latest "$ECR_REPO:latest"
+          docker push "$ECR_REPO:${{ steps.meta.outputs.sha_tag }}"
+          docker push "$ECR_REPO:latest"
+          if [ -n "${{ steps.meta.outputs.version_tag }}" ]; then
+            docker tag ${{ env.IMAGE_NAME }}:latest "$ECR_REPO:${{ steps.meta.outputs.version_tag }}"
+            docker push "$ECR_REPO:${{ steps.meta.outputs.version_tag }}"
+          fi
