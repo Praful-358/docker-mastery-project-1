@@ -2,8 +2,7 @@
 # PHASE 3 - ADVANCED
 # Multi-stage, Alpine-based, non-root, with a HEALTHCHECK.
 # Designed to be built, cached, scanned, tagged, and pushed
-# to Docker Hub + AWS ECR by the CI/CD pipeline in
-# .github/workflows/ci-cd.yml
+# to AWS ECR by the CI/CD pipeline.
 # =========================================================
 
 # ---------- Stage 1: Builder ----------
@@ -11,10 +10,14 @@ FROM python:3.12-alpine AS builder
 
 WORKDIR /app
 
-# Build-time only dependencies needed to compile some Python wheels on Alpine
-RUN apk add --no-cache gcc musl-dev libffi-dev
+# Build-time dependencies needed to compile Python wheels
+RUN apk add --no-cache \
+    gcc \
+    musl-dev \
+    libffi-dev
 
 COPY requirements.txt .
+
 RUN pip install --no-cache-dir --user -r requirements.txt
 
 
@@ -23,22 +26,28 @@ FROM python:3.12-alpine
 
 WORKDIR /app
 
-# Create a dedicated, unprivileged user to run the app
-RUN addgroup -S appgroup && adduser -S appuser -G appgroup
+# Upgrade Alpine packages to patched versions
+RUN apk upgrade --no-cache
 
-# Copy only the installed packages (no compilers/build tools) + app code
+# Create a dedicated, unprivileged user
+RUN addgroup -S appgroup && \
+    adduser -S appuser -G appgroup
+
+# Copy only installed Python packages
 COPY --from=builder /root/.local /home/appuser/.local
+
+# Copy application code
 COPY app/ ./app
 
 ENV PATH=/home/appuser/.local/bin:$PATH \
     PYTHONUNBUFFERED=1
 
-# Drop root privileges
+# Run as non-root user
 USER appuser
 
 EXPOSE 8000
 
-# Container-level health check hitting the /health endpoint
+# Container health check
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
   CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" || exit 1
 
